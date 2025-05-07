@@ -1,9 +1,9 @@
 # lambda/index.py
 import json
 import os
-import boto3
 import re  # 正規表現モジュールをインポート
-from botocore.exceptions import ClientError
+import urllib.request
+from urllib.error import URLError, HTTPError
 
 
 # Lambda コンテキストからリージョンを抽出する関数
@@ -14,21 +14,14 @@ def extract_region_from_arn(arn):
         return match.group(1)
     return "us-east-1"  # デフォルト値
 
-# グローバル変数としてクライアントを初期化（初期値）
-bedrock_client = None
-
 # モデルID
 MODEL_ID = os.environ.get("MODEL_ID", "us.amazon.nova-lite-v1:0")
 
+# 推論APIのURL（Google Colab上のFastAPIエンドポイント）
+INFERENCE_API_URL = os.environ.get("INFERENCE_API_URL", "https://b5e2-35-245-86-16.ngrok-free.app/generate")
+
 def lambda_handler(event, context):
     try:
-        # コンテキストから実行リージョンを取得し、クライアントを初期化
-        global bedrock_client
-        if bedrock_client is None:
-            region = extract_region_from_arn(context.invoked_function_arn)
-            bedrock_client = boto3.client('bedrock-runtime', region_name=region)
-            print(f"Initialized Bedrock client in region: {region}")
-        
         print("Received event:", json.dumps(event))
         
         # Cognitoで認証されたユーザー情報を取得
@@ -54,73 +47,62 @@ def lambda_handler(event, context):
             "content": message
         })
         
-        # Nova Liteモデル用のリクエストペイロードを構築
-        # 会話履歴を含める
-        bedrock_messages = []
-        for msg in messages:
-            if msg["role"] == "user":
-                bedrock_messages.append({
-                    "role": "user",
-                    "content": [{"text": msg["content"]}]
-                })
-            elif msg["role"] == "assistant":
-                bedrock_messages.append({
-                    "role": "assistant", 
-                    "content": [{"text": msg["content"]}]
-                })
-        
-        # invoke_model用のリクエストペイロード
+        # FastAPI用のリクエストペイロードを構築
         request_payload = {
-            "messages": bedrock_messages,
-            "inferenceConfig": {
-                "maxTokens": 512,
-                "stopSequences": [],
-                "temperature": 0.7,
-                "topP": 0.9
-            }
+            "model_id": MODEL_ID,
+            "messages": messages
         }
         
-        print("Calling Bedrock invoke_model API with payload:", json.dumps(request_payload))
+        print("Calling FastAPI inference endpoint with payload:", json.dumps(request_payload))
         
-        # invoke_model APIを呼び出し
-        response = bedrock_client.invoke_model(
-            modelId=MODEL_ID,
-            body=json.dumps(request_payload),
-            contentType="application/json"
+        # FastAPIエンドポイントにリクエストを送信
+        req = urllib.request.Request(
+            INFERENCE_API_URL,
+            data=json.dumps(request_payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json'},
+            method='POST'
         )
         
-        # レスポンスを解析
-        response_body = json.loads(response['body'].read())
-        print("Bedrock response:", json.dumps(response_body, default=str))
+        try:
+            with urllib.request.urlopen(req) as response:
+                response_body = json.loads(response.read().decode('utf-8'))
+                print("Inference API response:", json.dumps(response_body, default=str))
+                
+                # 応答の検証
+                if not response_body.get('success') or not response_body.get('response'):
+                    raise Exception("No valid response from the inference API")
+                
+                # アシスタントの応答を取得
+                assistant_response = response_body['response']
+                
+                # アシスタントの応答を会話履歴に追加
+                messages.append({
+                    "role": "assistant",
+                    "content": assistant_response
+                })
+                
+                # 成功レスポンスの返却
+                return {
+                    "statusCode": 200,
+                    "headers": {
+                        "Content-Type": "application/json",
+                        "Access-Control-Allow-Origin": "*",
+                        "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
+                        "Access-Control-Allow-Methods": "OPTIONS,POST"
+                    },
+                    "body": json.dumps({
+                        "success": True,
+                        "response": assistant_response,
+                        "conversationHistory": messages
+                    })
+                }
         
-        # 応答の検証
-        if not response_body.get('output') or not response_body['output'].get('message') or not response_body['output']['message'].get('content'):
-            raise Exception("No response content from the model")
-        
-        # アシスタントの応答を取得
-        assistant_response = response_body['output']['message']['content'][0]['text']
-        
-        # アシスタントの応答を会話履歴に追加
-        messages.append({
-            "role": "assistant",
-            "content": assistant_response
-        })
-        
-        # 成功レスポンスの返却
-        return {
-            "statusCode": 200,
-            "headers": {
-                "Content-Type": "application/json",
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Allow-Headers": "Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token",
-                "Access-Control-Allow-Methods": "OPTIONS,POST"
-            },
-            "body": json.dumps({
-                "success": True,
-                "response": assistant_response,
-                "conversationHistory": messages
-            })
-        }
+        except HTTPError as e:
+            print(f"HTTPError: {e.code} {e.reason}")
+            raise Exception(f"HTTPError: {e.code} {e.reason}")
+        except URLError as e:
+            print(f"URLError: {e.reason}")
+            raise Exception(f"URLError: {e.reason}")
         
     except Exception as error:
         print("Error:", str(error))
